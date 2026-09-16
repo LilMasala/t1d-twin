@@ -127,6 +127,61 @@ On HUPA, they improve the results. On UOM, where participants have roughly two m
 
 The obvious next version is to weaken the population prior as record length grows. I have not tuned that rule against these test sets.
 
+## Pump-setting experiments
+
+The benchmark above only asks whether the twin reproduces glucose under insulin that was actually delivered. A settings experiment asks something harder: what would a dose that never happened have done?
+
+I ran two checks on that.
+
+### Absolute dose response
+
+`scripts/twin_dose_response.py` gives a fitted twin one extra unit of insulin, or ten extra grams of carbs, at quiet moments and measures what happens. That gives an implied ISF and an implied carb ratio for the twin, which can be compared with how the person actually doses.
+
+The first result was bad. Across the 17 benchmarked twins, the implied carb ratio correlated −0.12 with the grams per unit each person actually bolused, and implied ISF was about a third of what the 1800 rule suggests.
+
+The cause is that nearly every meal comes with a bolus. A CGM trace shows the combined effect of the meal and the insulin, but not how strong each one is on its own, and the fitted disturbance term soaks up whatever is left. The ten base virtual patients differ by about 3× in carb ratio but by roughly 1% in how well they fit a given person.
+
+`t1d_twin/dosing.py` uses the person's dosing to fill that gap. Among base patients that fit about as well as the best one, it picks the one whose carb ratio is closest to the person's, then re-centres the insulin-sensitivity prior.
+
+On four refitted people that raised the correlation to +0.60 without hurting forecast accuracy. The twins still sit about 40% below the person's own ratio, though. Putting the ratio directly into the fitting objective did not close the gap, because the CGM data pull the other way. Part of the gap is that people give 20–30% of their bolus insulin as corrections outside meals. The rest I can't explain yet.
+
+So I would not read absolute recommendations off these twins, like "your carb ratio should be 12".
+
+### Relative effects
+
+The more useful question is whether the twin gets the relative picture right: which setting matters, and in which direction.
+
+`scripts/twin_effect_robustness.py` checks that by running the same arms on several fits of one person. The fits disagree about absolute dose response (the original fit, the dosing-informed prior, and the dosing term in the objective). If their conclusions agree anyway, the conclusions don't depend on the part the data can't pin down.
+
+The arms scale what was actually delivered. A carb ratio of ×0.8 makes each recorded meal bolus 25% larger, ISF ×0.8 does the same to correction boluses, and basal is scaled directly. The unchanged arm is the recorded day itself.
+
+For open-loop pumps like these, that is the literal counterfactual. For a closed loop, it leaves out how the algorithm would have reacted.
+
+I first tried driving the arms through a generic basal-bolus controller instead (`--mode controller`). Even its unchanged arm drifted away from the real day, and some arms collapsed in ways no 20% settings change would cause.
+
+Ten fitted days, 16 posterior samples, carb ratio, ISF and basal each at ×0.8 and ×1.2:
+
+| Person | Time below 70 | Time above 180 | Time in range |
+| --- | --- | --- | --- |
+| UOM 2307 | same direction, ρ 1.00 | same direction, ρ ≥ 0.94 | same direction, ρ ≥ 0.89 |
+| UOM 2309 | same direction, ρ 1.00 | same direction, ρ 1.00 | **direction differs**, ρ 0.43 |
+| HUPA0001P | same direction, ρ 1.00 | same direction, ρ 1.00 | same direction, ρ 1.00 |
+| HUPA0028P | same direction, ρ 1.00 | same direction, ρ 1.00 | same direction, ρ ≥ 0.94 |
+
+ρ is the rank correlation of the arms' effects between fits.
+
+For lows and highs, every fit of every person agrees on which way each setting moves things, and on the order of the effects.
+
+Time in range is where they can disagree. For 2309, making meal boluses 25% larger adds 5–7.5 points below 70 and removes 4.5–5.7 points above 180 in every fit. Those nearly cancel, so whether time in range goes up or down depends on the fit, which is exactly the part the data can't identify. I would report lows and highs separately rather than time in range alone.
+
+The results are also person-specific in ways that match the records. For HUPA0001P, basal is by far the biggest lever (×0.8 costs 17–22 points of time in range) and ISF barely matters, because only 6% of their bolus insulin is corrections. For HUPA0028P it is the reverse: carb ratio dominates and basal hardly moves anything.
+
+A few things to keep in mind:
+
+- Effect sizes differ between fits by up to about 2× (2307, carb ratio ×0.8: +3.1 to +6.0 points below 70), so treat magnitudes as rough.
+- An ISF arm can only scale corrections that were actually given, so it reads as zero for someone who never corrects (2309).
+- The unchanged arm does not always match the real days. 2309's twins spend 5% of the time below 70 where the person spent 1.5%, so their lows are overstated before any setting changes.
+
 ## Install
 
 ```bash
@@ -175,6 +230,13 @@ Once several people have been fitted, a new fit can use them to build its popula
 python scripts/twin_fit.py --records path/to/raw_days --person-id bob --population-fits "artifacts/*/twin.json" --out artifacts/bob/twin.json
 ```
 
+For settings questions, I would run the arms on the recorded delivery, across more than one fit, and look at lows and highs separately:
+
+```bash
+python scripts/twin_effect_robustness.py --records path/to/raw_days \
+    --twin base=artifacts/alice/twin.json --twin dosing=artifacts/alice/twin_dosing.json --out artifacts/alice/effects.json
+```
+
 For parameter recovery, `scripts/twin_recovery.py` creates and refits a synthetic person whose true parameters are known. That is the easiest way to see which physiological quantities the model can actually identify.
 
 ### Input format
@@ -216,7 +278,9 @@ The benchmark tests whether the fitted twin can reproduce glucose when given ins
 
 Synthetic experiments are encouraging at the population level: changing pump settings moves glucose in the expected direction and the mean treatment effects are recovered reasonably well.
 
-Individual physiological parameters are less clean. Insulin sensitivity and absorption speed, for example, can trade off against each other. Two fitted twins can therefore forecast glucose similarly while disagreeing about why it happened.
+Individual physiological parameters are less clean. Insulin sensitivity and absorption speed, for example, can trade off against each other, and on real data the strength of insulin relative to carbs is barely identified at all (see "Pump-setting experiments"). Two fitted twins can therefore forecast glucose similarly while disagreeing about why it happened.
+
+The relative picture holds up much better than the absolute one. Across fits that disagree about dose response, the direction and ranking of effects on lows and highs stay the same. Absolute carb ratios and ISFs don't, and none of the data here includes a person whose settings actually changed, which is what a real validation would need.
 
 For now, I would treat pump-setting experiments from the model as hypotheses rather than treatment recommendations.
 
@@ -228,9 +292,9 @@ There are two other limits worth keeping in mind. Held-out full-day forecasts ar
 pytest tests/test_twin.py
 ```
 
-There are currently 26 tests and the suite takes about 90 seconds.
+There are currently 30 tests and the suite takes about two minutes.
 
-They cover parity with simglucose, messy real-world input handling, context effects, fit serialisation, intervention direction, and the two negative experiments above.
+They cover parity with simglucose, messy real-world input handling, context effects, fit serialisation, intervention direction, the dosing prior, the recorded-delivery experiments, and the two negative experiments above.
 
 ## Licences and data
 

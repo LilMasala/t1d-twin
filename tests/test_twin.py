@@ -458,3 +458,60 @@ def test_empirical_priors_recentre_on_other_people_and_leave_the_person_out(synt
     assert abs(spec.prior_mean - 0.45) < 1e-6
     assert spec.prior_sd == pytest.approx(0.5 * twin_priors().get("log_insulin_speed").prior_sd)  # tight spread floored at half
     assert pri.get("cycle_luteal_si") == twin_priors().get("cycle_luteal_si")  # knobs outside the list untouched
+
+
+def test_dosing_prior_moves_the_twin_carb_ratio_toward_the_person():
+    """A CGM trace cannot separate insulin strength from carb strength, so dosing behaviour sets it."""
+    from t1d_twin.dosing import carb_ratio_prior, observed_carb_ratio, probe_carb_ratio
+
+    base = "adult#005"
+    at_base, isf_at_base = probe_carb_ratio(base)
+    assert 4.0 < at_base < 7.0 and isf_at_base > 0  # simglucose publishes 5 g/U for this adult
+
+    priors, info = carb_ratio_prior(twin_priors(), base, target_g_per_u=12.0)
+    assert info["applied"] and info["log_si_prior_mean"] > 0  # needs more insulin sensitivity than the base adult
+    assert abs(info["reached_carb_ratio_g_per_u"] - 12.0) < 1.0
+    assert priors.get("log_si").prior_sd == twin_priors().get("log_si").prior_sd  # a nudge, not a constraint
+
+    # a person who doses 5 g/U on the same base needs no shift
+    _, same = carb_ratio_prior(twin_priors(), base, target_g_per_u=at_base)
+    assert abs(same["shift"]) < 0.05
+
+
+def test_observed_carb_ratio_reads_grams_per_unit_from_bolused_meals():
+    from t1d_twin.dosing import observed_carb_ratio
+
+    rec = _record("2026-01-10")  # already carries a 1 U bolus at 12:01 UTC
+    anchor = datetime.fromisoformat(rec["utc_anchor"].replace("Z", "+00:00"))
+    rec["events"]["carbs_g"]["events"] = [{"timestamp": (anchor + timedelta(hours=12)).isoformat().replace("+00:00", "Z"), "value": 30.0}]
+    ratio, n = observed_carb_ratio(build_timeline([rec], "doser"))
+    assert n == 1 and ratio == pytest.approx(30.0, abs=0.5)
+
+
+def test_negative_disturbance_cannot_push_glucose_below_zero():
+    base = ode.base_patient("adult#001")
+    p, Vg, x0 = ode.stack_params([base])
+    n = 300
+    one = torch.ones(1, n, dtype=torch.float64)
+    ins = torch.full((1, n), base.basal_u_per_hr / 60.0, dtype=torch.float64)
+    sink = torch.full((1, n), -8.0, dtype=torch.float64)  # the fit's clamp, held for 10 hours
+    g = ode.simulate(x0, p, Vg, torch.zeros(1, n, dtype=torch.float64), torch.zeros(1, n, dtype=torch.bool), ins, one, one, one, flux=sink)
+    assert float(g.min()) > 0.0
+    # above the floor the sink acts in full, so fitted days are unchanged
+    free = ode.simulate(x0, p, Vg, torch.zeros(1, n, dtype=torch.float64), torch.zeros(1, n, dtype=torch.bool), ins, one, one, one)
+    assert float(free[0, 5] - g[0, 5]) > 1.0
+
+
+def test_delivery_experiment_replays_the_real_day_and_scales_meal_boluses(synthetic):
+    from t1d_twin.experiment import Arm, run_delivery_experiment, split_boluses
+
+    _, truth, tl = synthetic
+    fit = truth_as_fit(truth, tl)
+    meal, correction = split_boluses(tl)
+    assert np.allclose(meal + correction, tl.bolus_upm) and meal.sum() > 0
+    arms = [Arm("current"), Arm("cr_x0.5", 0.5, 1.0, 1.0), Arm("basal_x0.5", 1.0, 1.0, 0.5)]
+    res = run_delivery_experiment(fit, tl, arms, samples=4, days=(1, 3), seed=1)
+    cur, more = res["arms"]["current"], res["arms"]["cr_x0.5"]
+    assert more["insulin_delivered_u"] > cur["insulin_delivered_u"]
+    assert more["paired_delta_vs_first_arm"]["mean_mgdl"]["median"] < 0       # doubling meal boluses lowers glucose
+    assert res["arms"]["basal_x0.5"]["paired_delta_vs_first_arm"]["mean_mgdl"]["median"] > 0  # halving basal raises it

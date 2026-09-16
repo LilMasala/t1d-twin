@@ -37,7 +37,8 @@ import torch
 from t1d_twin import ode
 from t1d_twin.context import build_features
 from t1d_twin.data import PersonTimeline, detect_unlogged_meals, shift_events
-from t1d_twin.model import DTYPE, FLUX_BLOCK_STEPS, TwinProblem
+from t1d_twin.dosing import MIN_MEALS as MIN_DOSED_MEALS, carb_ratio_logprior, carb_ratio_prior, observed_carb_ratio
+from t1d_twin.model import DTYPE, FLUX_BLOCK_STEPS, TwinProblem, transform_globals
 from t1d_twin.params import (
     FLUX_CLAMP,
     FLUX_PRIOR_DF,
@@ -77,6 +78,12 @@ class FitConfig:
     response_kernels: bool = True
     # fit residuals in Kovatchev glycaemic risk space (errors at low glucose weigh more)
     risk_weighted: bool = False
+    # centre the insulin-sensitivity prior, and break base-patient ties, so the twin's
+    # balanced carb ratio matches the one the person doses at (t1d_twin.dosing)
+    dosing_prior: bool = True
+    # a base patient may be chosen over the best-fitting one when its RMSE is within
+    # this fraction of the best, since screen RMSE barely separates them
+    base_rmse_tolerance: float = 0.10
 
 
 @dataclass
@@ -204,8 +211,15 @@ def select_clock_offset(tl: PersonTimeline, base: str, days: list[int], priors: 
     return best, {f"{k:+.0f}": v for k, v in scores.items()}
 
 
-def select_base(tl: PersonTimeline, days: list[int], priors: TwinPriors, feats, unlogged, min_cgm_coverage: float = 0.7) -> tuple[str, dict[str, float], tuple[float, float]]:
+def select_base(tl: PersonTimeline, days: list[int], priors: TwinPriors, feats, unlogged, min_cgm_coverage: float = 0.7,
+                target_carb_ratio: float = float("nan"), rmse_tolerance: float = 0.0) -> tuple[str, dict[str, float], tuple[float, float]]:
     """Pick the UVA/Padova adult whose dynamics best fit, over a coarse SI x EGP grid.
+
+    Screen RMSE separates the adults poorly (often under 2% between the best and
+    a patient three times less insulin sensitive), while their dose response
+    differs a lot. With ``target_carb_ratio`` (the grams per unit this person
+    doses at), any adult within ``rmse_tolerance`` of the best is eligible and
+    the one whose own carb ratio is closest to theirs wins.
 
     Also returns the best (log_si, log_egp) grid point, used to start the fit.
     """
@@ -228,6 +242,12 @@ def select_base(tl: PersonTimeline, days: list[int], priors: TwinPriors, feats, 
         scores[name] = float(torch.sqrt(err.min()))
         best_point[name] = grid[int(err.argmin())]
     best = min(scores, key=scores.get)
+    if np.isfinite(target_carb_ratio) and target_carb_ratio > 0 and rmse_tolerance > 0:
+        from t1d_twin.dosing import base_carb_ratios
+
+        ratios = base_carb_ratios()
+        eligible = [n for n, v in scores.items() if v <= scores[best] * (1.0 + rmse_tolerance)]
+        best = min(eligible, key=lambda n: abs(math.log(ratios[n] / target_carb_ratio)) if ratios.get(n, 0) > 0 else 1e9)
     return best, scores, best_point[best]
 
 
@@ -268,6 +288,12 @@ def log_joint(prob: TwinProblem, u, z_locals) -> tuple[torch.Tensor, torch.Tenso
     logprior = logprior + _normal_logpdf(sl, torch.zeros(()), torch.tensor(LOGGED_SHIFT_PRIOR_SD)).sum(1)
     logprior = logprior + _normal_logpdf(su, torch.zeros(()), torch.tensor(UNLOGGED_SHIFT_PRIOR_SD)).sum(1)
     logprior = logprior + _student_t_logpdf(fx, FLUX_PRIOR_SCALE, FLUX_PRIOR_DF).sum(1)
+    target = getattr(prob, "target_carb_ratio", float("nan"))
+    if np.isfinite(target):
+        # the CGM pins the net effect of a meal and its bolus, not each one's size,
+        # and the disturbance flux absorbs what is left, so the person's own dosing
+        # sets the ratio (t1d_twin.dosing)
+        logprior = logprior + carb_ratio_logprior(transform_globals(u, priors), prob.base.name, prob.tl.body_mass_kg, target)
     return loglik + logprior, sim
 
 
@@ -340,8 +366,13 @@ def fit_twin(
     # screen on the first fittable days, not the first calendar days
     usable = TwinProblem(tl, UNCALIBRATED_BASE, train_days, priors, feats=feats, unlogged=[], min_cgm_coverage=config.min_cgm_coverage).days
     screen = usable[: config.base_screen_days]
+    target_ratio, n_dosed_meals = observed_carb_ratio(tl, {s for d in usable for s in range(*tl.day_steps(d))}) if config.dosing_prior else (float("nan"), 0)
+    if n_dosed_meals < MIN_DOSED_MEALS:
+        target_ratio = float("nan")  # too few bolused meals to read a ratio off
+    pick_base = lambda: select_base(tl, screen, priors, feats, unlogged, config.min_cgm_coverage,
+                                    target_ratio, config.base_rmse_tolerance)
     if config.base == "auto":
-        base, base_scores, _ = select_base(tl, screen, priors, feats, unlogged, config.min_cgm_coverage)
+        base, base_scores, _ = pick_base()
     else:
         base, base_scores = config.base, {}
     offset, offset_scores = 0.0, {}
@@ -351,12 +382,20 @@ def fit_twin(
             tl = shift_events(tl, offset)
             feats, unlogged = build_features(tl), candidates(tl)
             if config.base == "auto":
-                base, base_scores, _ = select_base(tl, screen, priors, feats, unlogged, config.min_cgm_coverage)
+                base, base_scores, _ = pick_base()
         if verbose:
             print(f"[twin] event clock offset {offset:+.0f} min (screen rmse by offset: "
                   + ", ".join(f"{k}:{v:.1f}" for k, v in offset_scores.items()) + ")")
+    dosing_info = {"observed_carb_ratio_g_per_u": target_ratio, "n_bolused_meals": n_dosed_meals, "applied": False}
+    if np.isfinite(target_ratio):
+        priors, dosing_info = carb_ratio_prior(priors, base, target_ratio)
+        dosing_info.update(observed_carb_ratio_g_per_u=target_ratio, n_bolused_meals=n_dosed_meals)
+        if verbose:
+            print(f"[twin] doses {target_ratio:.1f} g/U over {n_dosed_meals} meals; {base} is {dosing_info['base_carb_ratio_g_per_u']:.1f} g/U, "
+                  f"log_si prior re-centred to {dosing_info['log_si_prior_mean']:+.2f} (twin now {dosing_info['reached_carb_ratio_g_per_u']:.1f} g/U)")
     prob = TwinProblem(tl, base, train_days, priors, feats=feats, unlogged=unlogged, min_cgm_coverage=config.min_cgm_coverage, flux=config.flux)
     prob.risk_weighted = config.risk_weighted
+    prob.target_carb_ratio = target_ratio
     if verbose:
         print(f"[twin] {tl.person_id}: base={base} fitted_days={prob.n_days} skipped={len(prob.skipped)} "
               f"logged_meals={prob.n_logged} likely_unlogged={prob.n_unlogged} obs={int(prob.mask_t.sum())}")
@@ -468,6 +507,7 @@ def fit_twin(
         "loss_first_last": [history[0] if history else None, history[-1] if history else None],
         "fit_seconds": round(time.time() - t_start, 1),
         "config": asdict(config),
+        "dosing": dosing_info,
     }
     if holdout_days:
         fit.diagnostics["holdout"] = evaluate_holdout(fit, tl, holdout_days, feats=feats, min_cgm_coverage=config.min_cgm_coverage)

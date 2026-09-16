@@ -20,7 +20,8 @@ be fitted by gradient. ``tests/test_twin.py`` checks the two agree. Differences 
   person (``r1`` = 0 recovers the 2008 model exactly);
 - an optional signed glucose flux (mg/kg/min) enters plasma glucose directly:
   the fitted disturbance for what the records do not explain (unlogged food,
-  unlogged activity).
+  unlogged activity). A negative flux fades out below 40 mg/dL, so a fitted sink
+  replayed under more insulin cannot push glucose below zero.
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ import torch
 
 DT_MIN = 2.0
 HYPO_THRESHOLD_MGDL = 60.0
+# a negative disturbance is a glucose sink, and a sink needs glucose to act on: it
+# fades linearly below this plasma glucose, so it cannot drive glucose through zero
+FLUX_SINK_FLOOR_MGDL = 40.0
 STEPS_PER_DAY = int(24 * 60 / DT_MIN)
 ADULTS = tuple(f"adult#{i:03d}" for i in range(1, 11))
 
@@ -114,6 +118,8 @@ def rhs(x, p, cho, ins, dbar, flux):
     Vmt = p["Vm0"] + p["Vmx"] * x[:, 6] * (1.0 + p["r1"] * risk)
     Uidt = Vmt * x[:, 4] / (p["Km0"] + x[:, 4])
     It = x[:, 5] / p["Vi"]
+    sink = torch.clamp(G / FLUX_SINK_FLOOR_MGDL, min=0.0, max=1.0)
+    flux = torch.where(flux < 0, flux * sink, flux)
 
     pos = (x >= 0).to(x.dtype)
     dx = torch.stack([

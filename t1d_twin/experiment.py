@@ -237,3 +237,101 @@ def _q(v: torch.Tensor) -> dict[str, float]:
         "p05": float(torch.quantile(v, 0.05)),
         "p95": float(torch.quantile(v, 0.95)),
     }
+
+
+MEAL_BOLUS_WINDOW_MIN = 20.0
+
+
+def split_boluses(tl: PersonTimeline) -> tuple[np.ndarray, np.ndarray]:
+    """Recorded bolus insulin [U/min per step], split into meal boluses and everything else.
+
+    A bolus within 20 minutes of a logged meal or a meal announcement (a
+    carb-free bolus, a food photo) counts as a meal bolus; the rest are
+    corrections.
+    """
+    from t1d_twin.data import detect_unlogged_meals
+
+    width = int(MEAL_BOLUS_WINDOW_MIN / ode.DT_MIN)
+    near_meal = np.zeros(tl.n_steps, bool)
+    steps = [m.step for m in tl.meals if m.logged] + [a.step for a in detect_unlogged_meals(tl, use_cgm_rises=False)]
+    for s in steps:
+        near_meal[max(0, s - width): s + width + 1] = True
+    meal = np.where(near_meal, tl.bolus_upm, 0.0)
+    return meal, tl.bolus_upm - meal
+
+
+def run_delivery_experiment(
+    fit: TwinFit,
+    tl: PersonTimeline,
+    arms: list[Arm],
+    *,
+    samples: int = 32,
+    days: tuple[int, int] | None = None,
+    seed: int = 0,
+) -> dict:
+    """Settings arms applied to what was actually delivered, instead of to a controller.
+
+    ``cr_mult`` scales every meal bolus by 1 / cr_mult (a lower carb ratio means more
+    insulin per gram), ``isf_mult`` scales correction boluses by 1 / isf_mult, and
+    ``basal_mult`` scales delivered basal. The first arm with all multipliers at 1
+    replays the recorded day exactly, so the fitted disturbance stays matched to the
+    insulin it was fitted under, and no settings are needed. For an open-loop pump
+    this is the literal counterfactual; for a closed loop it leaves out how the
+    algorithm would have reacted.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    priors = fit.priors()
+    tl = shift_events(tl, fit.event_clock_offset_min)
+    feats = build_features(tl)
+    d0, d1 = days if days is not None else (1, tl.n_days)
+    s0, _ = tl.day_steps(d0)
+    _, s1 = tl.day_steps(d1 - 1)
+    burn = int(BURN_IN_H * 60 / ode.DT_MIN)
+    start = max(0, s0 - burn)
+    n_steps = s1 - start
+
+    u = fit.sample_globals(samples, gen)
+    S = u.shape[0]
+    drift = torch.exp(u[:, priors.names().index("log_day_si_sd")])[:, None] * torch.randn(S, tl.n_days, generator=gen, dtype=DTYPE)
+    egp_drift = torch.exp(u[:, priors.names().index("log_day_egp_sd")])[:, None] * torch.randn(S, tl.n_days, generator=gen, dtype=DTYPE)
+    for fitted_days, locs, sds, target in ((fit.fitted_days, fit.day_drift_loc, fit.day_drift_sd, drift),
+                                           (fit.fitted_days, fit.day_egp_drift_loc, fit.day_egp_drift_sd, egp_drift)):
+        for date, l, sd in zip(fitted_days, locs, sds):
+            if date in tl.day_dates:
+                target[:, tl.day_dates.index(date)] = l + sd * torch.randn(S, generator=gen, dtype=DTYPE)
+    meals = _meal_draws(fit, tl, S, gen)
+    flux = _fitted_flux(fit, tl, start, n_steps)
+
+    meal_bolus, correction = split_boluses(tl)
+    sl = slice(start, start + n_steps)
+    basal = torch.tensor(np.nan_to_num(tl.basal_upm[sl]), dtype=DTYPE)
+    meal_t, corr_t = torch.tensor(meal_bolus[sl], dtype=DTYPE), torch.tensor(correction[sl], dtype=DTYPE)
+    A = len(arms)
+    bolus = torch.stack([meal_t / a.cr_mult + corr_t / a.isf_mult for a in arms]).repeat_interleave(S, dim=0)
+    insulin = torch.stack([basal * a.basal_mult for a in arms]).repeat_interleave(S, dim=0) + bolus
+    rep = lambda t: t.repeat(A, *([1] * (t.dim() - 1)))
+    with torch.no_grad():
+        glucose = rollout(
+            tl, fit.base, priors, rep(u), start, n_steps,
+            meal_grams=[(step, rep(g)) for step, g in meals],
+            day_log_si=rep(drift), day_log_egp=rep(egp_drift), insulin_upm=insulin, bolus_upm=bolus, feats=feats,
+            flux_upm=None if flux is None else flux.expand(A * S, -1),
+        )
+    scored = glucose[:, s0 - start:].view(A, S, -1)
+
+    delivered = lambda a: float((basal.sum() * a.basal_mult + (meal_t / a.cr_mult + corr_t / a.isf_mult).sum()) * ode.DT_MIN)
+    out = {"person_id": fit.person_id, "base": fit.base, "days": tl.day_dates[d0:d1], "samples": S,
+           "controller": "none: arms scale the recorded delivery",
+           "meal_bolus_share": float(meal_t.sum() / max(float((meal_t + corr_t).sum()), 1e-9)), "arms": {}}
+    base_metrics = None
+    for ai, arm in enumerate(arms):
+        mets = glycemic_metrics(scored[ai])
+        if base_metrics is None:
+            base_metrics = mets
+        out["arms"][arm.name] = {
+            "settings": {"cr_mult": arm.cr_mult, "isf_mult": arm.isf_mult, "basal_mult": arm.basal_mult},
+            "insulin_delivered_u": delivered(arm),
+            "metrics": {k: _q(v) for k, v in mets.items()},
+            "paired_delta_vs_first_arm": {k: _q(v - base_metrics[k]) for k, v in mets.items()},
+        }
+    return out
