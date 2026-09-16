@@ -208,7 +208,7 @@ python scripts/benchmark_t1dsimai_report.py --cohort uom
 
 The report script recomputes the statistics in this README directly from the saved score files.
 
-## What I would not trust yet
+## Limitations
 
 The main unresolved question is also the reason this project exists: counterfactuals.
 
