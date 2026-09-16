@@ -164,7 +164,7 @@ pytest tests/test_twin.py
 
 ## Licences and data
 
-Code here is ours. The virtual-patient parameters come from simglucose (MIT) and are read from your installed copy.
+This code is Apache 2.0 (see `LICENSE`). The virtual-patient parameters come from simglucose (MIT) and are read from your installed copy.
 
 T1DSim_AI is licensed for non-profit academic research only. It is used here as a benchmark, and neither its code, weights nor example data are redistributed in this repository.
 
